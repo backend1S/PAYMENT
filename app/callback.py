@@ -1,8 +1,7 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from app.db import get_db_connection
 from app.encryption import load_private_key, decrypt_response
-import os
-import json
+import os, json, time
 
 router = APIRouter()
 
@@ -12,70 +11,106 @@ PRIVATE_KEY_PATH = os.path.join(BASE_DIR, "keys", "private_key.pem")
 private_key = load_private_key(PRIVATE_KEY_PATH)
 
 
+def safe_get(data, *keys):
+    """Try multiple possible keys"""
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def normalize_status(status):
+    if not status:
+        return "UNKNOWN"
+
+    status = str(status).upper()
+
+    if status in ["SUCCESS", "S", "00"]:
+        return "SUCCESS"
+    if status in ["FAILURE", "FAILED", "F"]:
+        return "FAILED"
+    if status in ["PENDING", "INITIATED"]:
+        return "PENDING"
+
+    return status
+
+
 @router.post("/api/iciciwebhook")
 async def icici_webhook(request: Request):
 
-    print("\n🔥 ===== ICICI CALLBACK HIT =====")
+    print("\n🔥 ===== ICICI CALLBACK RECEIVED =====")
+    start_time = time.time()
 
     try:
         # =========================
-        # STEP 1: Read raw body
+        # 1️⃣ READ RAW BODY
         # =========================
         raw_body = await request.body()
+        headers = dict(request.headers)
 
-        print("🔹 HEADERS:", dict(request.headers))
-        print("🔹 RAW BODY LENGTH:", len(raw_body))
+        print("🔹 HEADERS:", headers)
+        print("🔹 RAW LENGTH:", len(raw_body))
 
-        # ❌ Ignore empty (Swagger/manual test)
         if not raw_body:
-            print("⚠️ Empty callback (ignored)")
+            print("⚠️ Empty callback (manual hit)")
             return {"status": "ignored"}
 
         # =========================
-        # STEP 2: Decode payload
+        # 2️⃣ DECODE SAFELY
         # =========================
         try:
-            encrypted_data = raw_body.decode("utf-8").strip()
+            encrypted_payload = raw_body.decode("utf-8").strip()
         except Exception as e:
             print("❌ Decode error:", str(e))
-            return {"status": "error", "message": "Invalid encoding"}
+            return {"status": "error", "message": "decode_failed"}
 
-        print("🔐 ENCRYPTED PAYLOAD (first 100 chars):", encrypted_data[:100])
+        print("🔐 ENCRYPTED PREVIEW:", encrypted_payload[:100])
 
         # =========================
-        # STEP 3: Decrypt
+        # 3️⃣ DECRYPT SAFELY
         # =========================
         try:
-            decrypted = decrypt_response(encrypted_data, private_key)
+            decrypted = decrypt_response(encrypted_payload, private_key)
 
             if isinstance(decrypted, str):
                 decrypted = json.loads(decrypted)
 
         except Exception as e:
             print("❌ Decryption failed:", str(e))
-            return {"status": "error", "message": "Decryption failed"}
+            return {"status": "error", "message": "decrypt_failed"}
 
         print("\n🔓 DECRYPTED CALLBACK:")
         print(json.dumps(decrypted, indent=4))
 
         # =========================
-        # STEP 4: Extract fields
+        # 4️⃣ EXTRACT ALL POSSIBLE FIELDS
         # =========================
-        txn_id = decrypted.get("merchantTranId")   # maps to PAYMENT_ID
-        status = decrypted.get("TxnStatus")        # SUCCESS / FAILURE
-        rrn = decrypted.get("BankRRN")             # bank reference
+        txn_id = safe_get(decrypted, "merchantTranId", "merchantTranID", "txnId")
+        status = safe_get(decrypted, "TxnStatus", "status", "txnStatus")
+        rrn = safe_get(decrypted, "BankRRN", "rrn", "bankRrn")
 
-        print("\n✅ PARSED VALUES:")
+        payer_name = safe_get(decrypted, "PayerName", "payerName")
+        payer_mobile = safe_get(decrypted, "PayerMobile", "payerMobile")
+        payer_vpa = safe_get(decrypted, "PayerVA", "payerVpa")
+        amount = safe_get(decrypted, "PayerAmount", "amount")
+
+        response_code = safe_get(decrypted, "ResponseCode", "responseCode")
+        response_desc = safe_get(decrypted, "RespCodeDescription", "message")
+
+        status = normalize_status(status)
+
+        print("\n✅ FINAL PARSED:")
         print("TXN ID:", txn_id)
         print("STATUS:", status)
         print("RRN:", rrn)
+        print("AMOUNT:", amount)
 
         if not txn_id:
-            print("❌ Missing merchantTranId")
-            return {"status": "error", "message": "Invalid callback data"}
+            print("❌ Missing transaction ID → ignoring")
+            return {"status": "error", "message": "invalid_payload"}
 
         # =========================
-        # STEP 5: Update DB
+        # 5️⃣ UPDATE DATABASE
         # =========================
         try:
             conn = get_db_connection()
@@ -101,16 +136,29 @@ async def icici_webhook(request: Request):
 
         except Exception as e:
             print("❌ DB ERROR:", str(e))
-            return {"status": "error", "message": "DB update failed"}
+            return {"status": "error", "message": "db_failed"}
 
         # =========================
-        # STEP 6: Response to ICICI
+        # 6️⃣ RESPONSE TO ICICI
         # =========================
-        return {
-            "status": "success",
-            "message": "Callback processed"
-        }
+        duration = round(time.time() - start_time, 3)
+        print(f"⏱️ Processed in {duration}s")
+
+        return Response(
+            content=json.dumps({
+                "status": "success"
+            }),
+            media_type="application/json",
+            status_code=200
+        )
 
     except Exception as e:
         print("❌ UNEXPECTED ERROR:", str(e))
-        return {"status": "error", "message": "Internal server error"}
+
+        return Response(
+            content=json.dumps({
+                "status": "error"
+            }),
+            media_type="application/json",
+            status_code=200
+        )
