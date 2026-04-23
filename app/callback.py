@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
 from app.encryption import load_private_key, decrypt_response
 from app.db import get_db_connection
 import os, json, base64, re
@@ -9,17 +8,15 @@ import xml.etree.ElementTree as ET
 
 router = APIRouter()
 
-# =========================
-# 🔐 LOAD PRIVATE KEY
-# =========================
+# 🔐 Load private key
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 PRIVATE_KEY_PATH = os.path.join(BASE_DIR, "keys", "private_key.pem")
 private_key = load_private_key(PRIVATE_KEY_PATH)
 
+# 🔁 Toggle this
+DEBUG_MODE = True   # 👉 change to False in production
 
-# =========================
-# ✅ ACK XML (ICICI REQUIRED)
-# =========================
+
 def ack_xml():
     return """<XML>
 <Notification>
@@ -28,43 +25,8 @@ def ack_xml():
 </XML>"""
 
 
-# =========================
-# 🔧 CLEAN STRING
-# =========================
-def clean_string(s: str):
-    if not s:
-        return s
-    return re.sub(r"\s+", "", s.strip())
-
-
-# =========================
-# 🔧 PARSERS
-# =========================
-def try_json(s):
-    try:
-        return json.loads(s)
-    except:
-        return None
-
-
-def try_xml(s):
-    try:
-        root = ET.fromstring(s)
-        data = {}
-        for child in root.iter():
-            if child.text:
-                data[child.tag] = child.text.strip()
-        return data
-    except:
-        return None
-
-
-def try_form(s):
-    try:
-        parsed = parse_qs(s)
-        return {k: v[0] for k, v in parsed.items()}
-    except:
-        return None
+def clean(s):
+    return re.sub(r"\s+", "", s.strip()) if s else s
 
 
 def is_base64(s):
@@ -75,92 +37,29 @@ def is_base64(s):
         return False
 
 
-# =========================
-# 🔍 EXTRACT PAYLOAD (ALL SOURCES)
-# =========================
-def extract_payload(request, raw_body, headers):
-
-    debug = {}
-
-    # 🔹 BODY
-    if raw_body:
-        body = raw_body.decode(errors="ignore").strip()
-        debug["body"] = body
-
-        # JSON
-        j = try_json(body)
-        if isinstance(j, dict):
-            return j.get("data") or j.get("payload") or body, debug
-
-        # FORM
-        f = try_form(body)
-        if f:
-            return f.get("data") or f.get("payload") or body, debug
-
-        return body, debug
-
-    # 🔹 QUERY PARAM
-    if request.query_params:
-        qp = dict(request.query_params)
-        debug["query"] = qp
-        return list(qp.values())[0], debug
-
-    # 🔹 HEADERS
-    debug["headers_payload"] = headers.get("payload")
-    return headers.get("payload"), debug
+def try_json(s):
+    try:
+        return json.loads(s)
+    except:
+        return None
 
 
-# =========================
-# 🔓 DECRYPT OR PARSE
-# =========================
-def parse_icici_payload(enc):
-
-    enc = clean_string(enc)
-
-    # Try decrypt
-    if is_base64(enc):
-        try:
-            return decrypt_response(enc, private_key), "decrypted"
-        except Exception as e:
-            return {"decrypt_error": str(e)}, "decrypt_failed"
-
-    # Try JSON
-    j = try_json(enc)
-    if j:
-        return j, "json"
-
-    # Try XML
-    x = try_xml(enc)
-    if x:
-        return x, "xml"
-
-    # Try FORM
-    f = try_form(enc)
-    if f:
-        return f, "form"
-
-    return {"raw": enc}, "raw"
+def try_form(s):
+    try:
+        return {k: v[0] for k, v in parse_qs(s).items()}
+    except:
+        return None
 
 
-# =========================
-# 🔁 NORMALIZE
-# =========================
-def normalize(d):
-    return {
-        "txn_id": d.get("merchantTranId"),
-        "status": d.get("TxnStatus"),
-        "rrn": d.get("BankRRN"),
-        "amount": d.get("PayerAmount"),
-        "payer_name": d.get("PayerName"),
-        "payer_vpa": d.get("PayerVA"),
-        "payer_mobile": d.get("PayerMobile"),
-    }
+def try_xml(s):
+    try:
+        root = ET.fromstring(s)
+        return {child.tag: child.text for child in root.iter() if child.text}
+    except:
+        return None
 
 
-# =========================
-# 🔥 MAIN WEBHOOK
-# =========================
-@router.post("/api/iciciwebhook")
+@router.post("/payments/api/iciciwebhook")
 async def icici_webhook(request: Request):
 
     print("\n🔥 ===== ICICI CALLBACK HIT =====")
@@ -171,129 +70,164 @@ async def icici_webhook(request: Request):
         raw_body = await request.body()
         headers = dict(request.headers)
 
-        print("📥 HEADERS:", headers)
-        print("📥 RAW BODY:", raw_body)
-
         debug["headers"] = headers
         debug["raw_body"] = raw_body.decode(errors="ignore")
 
-        # 🔍 Extract payload
-        enc, extract_debug = extract_payload(request, raw_body, headers)
-        debug["extract_debug"] = extract_debug
-        debug["extracted_payload"] = enc
+        print("📥 HEADERS:", headers)
+        print("📥 RAW:", raw_body)
 
-        if not enc:
-            print("❌ NO PAYLOAD FOUND")
-            return JSONResponse({
-                "status": "no_payload",
-                "debug": debug,
-                "ack": ack_xml()
-            })
+        # =========================
+        # 🔍 EXTRACT PAYLOAD
+        # =========================
+        body = raw_body.decode(errors="ignore").strip()
+        payload = body
 
-        print("🔐 EXTRACTED:", enc[:100])
+        if not payload:
+            payload = list(request.query_params.values())[0] if request.query_params else None
 
-        # 🔓 Decrypt / parse
-        parsed, mode = parse_icici_payload(enc)
-        debug["parse_mode"] = mode
+        debug["payload"] = payload
+
+        if not payload:
+            return JSONResponse({"status": "no_payload", "debug": debug})
+
+        payload = clean(payload)
+
+        print("🔐 PAYLOAD:", payload[:100])
+
+        # =========================
+        # 🔓 DECRYPT / PARSE
+        # =========================
+        parsed = None
+
+        if is_base64(payload):
+            try:
+                parsed = decrypt_response(payload, private_key)
+                debug["decrypt_mode"] = "base64_decrypted"
+            except Exception as e:
+                debug["decrypt_error"] = str(e)
+
+        if not parsed:
+            parsed = try_json(payload) or try_form(payload) or try_xml(payload) or {"raw": payload}
+            debug["fallback_mode"] = "non_encrypted"
+
         debug["parsed"] = parsed
 
-        print("🔓 PARSED:", parsed)
-
-        # Normalize
-        normalized = normalize(parsed)
-        debug["normalized"] = normalized
-
-        print("✅ NORMALIZED:", normalized)
+        print("🔓 PARSED:")
+        print(json.dumps(parsed, indent=4))
 
         # =========================
-        # 💾 DB UPDATE
+        # 💾 SAVE CALLBACK
         # =========================
-        if normalized["txn_id"]:
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
+            cursor.execute("""
+            INSERT INTO PAYMENTS_ICICI_CALLBACK (
+                MERCHANTID,
+                MERCHANTTRANID,
+                BANKRRN,
+                PAYERNAME,
+                PAYERMOBILE,
+                PAYERVA,
+                PAYERAMOUNT,
+                TXNSTATUS,
+                TXNINITDATE,
+                TXNCOMPLETIONDATE,
+                RESPONSECODE,
+                RESPCODEDESCRIPTION,
+                PAYEEVPA,
+                PAYERACCOUNTTYPE,
+                CREATED_DATE,
+                MODIFIED_DATE
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), GETDATE())
+            """,
+                parsed.get("merchantId"),
+                parsed.get("merchantTranId"),
+                parsed.get("BankRRN"),
+                parsed.get("PayerName"),
+                parsed.get("PayerMobile"),
+                parsed.get("PayerVA"),
+                parsed.get("PayerAmount"),
+                parsed.get("TxnStatus"),
+                parsed.get("TxnInitDate"),
+                parsed.get("TxnCompletionDate"),
+                parsed.get("ResponseCode"),
+                parsed.get("RespCodeDescription"),
+                parsed.get("PayeeVPA"),
+                parsed.get("PayerAccountType")
+            )
+
+            conn.commit()
+            conn.close()
+
+            debug["callback_saved"] = True
+
+        except Exception as e:
+            debug["callback_db_error"] = str(e)
+
+        # =========================
+        # 🔁 UPDATE PAYMENT
+        # =========================
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            txn_id = parsed.get("merchantTranId")
+            status = parsed.get("TxnStatus")
+            rrn = parsed.get("BankRRN")
+
+            debug["txn_id"] = txn_id
+            debug["status"] = status
+
+            if txn_id:
                 cursor.execute("""
-                    UPDATE PAYMENT
-                    SET PAYMENT_STATUS=?, GATEWAY_PAYMENT_ID=?, UPDATED_AT=GETDATE()
-                    WHERE PAYMENT_ID=?
-                """,
-                normalized["status"],
-                normalized["rrn"],
-                normalized["txn_id"]
-                )
+                    SELECT PAYMENT_ID, CUSTOMER_NAME, PAYMENT_STATUS
+                    FROM PAYMENT WHERE PAYMENT_ID=?
+                """, txn_id)
 
-                conn.commit()
-                conn.close()
+                row = cursor.fetchone()
 
-                debug["db"] = "updated"
-                print("✅ DB UPDATED")
+                if row:
+                    debug["customer"] = row[1]
 
-            except Exception as e:
-                debug["db_error"] = str(e)
-                print("❌ DB ERROR:", e)
+                    if row[2] != "SUCCESS":
+                        cursor.execute("""
+                        UPDATE PAYMENT
+                        SET PAYMENT_STATUS=?, GATEWAY_PAYMENT_ID=?, UPDATED_AT=GETDATE()
+                        WHERE PAYMENT_ID=?
+                        """,
+                            status,
+                            rrn,
+                            txn_id
+                        )
+
+                        debug["payment_updated"] = True
+                    else:
+                        debug["already_success"] = True
+                else:
+                    debug["no_payment_found"] = True
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            debug["payment_update_error"] = str(e)
 
         # =========================
-        # RESPONSE
+        # 🎯 RESPONSE
         # =========================
-        return JSONResponse({
-            "status": "success",
-            "ack_xml": ack_xml(),
-            "debug": debug
-        })
+        if DEBUG_MODE:
+            return JSONResponse({
+                "status": "debug",
+                "debug": debug
+            })
+
+        return Response(content=ack_xml(), media_type="application/xml")
 
     except Exception as e:
-        print("❌ UNEXPECTED ERROR:", e)
-
         return JSONResponse({
             "status": "error",
-            "error": str(e),
-            "ack_xml": ack_xml()
-        })
-
-
-# =========================
-# 🔓 SWAGGER DECRYPT API
-# =========================
-class DecryptRequest(BaseModel):
-    encrypted_data: str
-
-
-@router.post("/api/icici/decrypt")
-async def decrypt_api(req: DecryptRequest):
-
-    try:
-        enc = clean_string(req.encrypted_data)
-
-        decrypted = decrypt_response(enc, private_key)
-
-        return {
-            "encrypted": enc,
-            "decrypted": decrypted
-        }
-
-    except Exception as e:
-        return {
             "error": str(e)
-        }
-
-
-# =========================
-# 🔓 RAW DECRYPT API
-# =========================
-@router.post("/api/icici/decrypt-raw")
-async def decrypt_raw(request: Request):
-
-    raw = await request.body()
-
-    if not raw:
-        return {"error": "no data"}
-
-    try:
-        enc = clean_string(raw.decode())
-        decrypted = decrypt_response(enc, private_key)
-
-        return decrypted
-
-    except Exception as e:
-        return {"error": str(e)}
+        })
