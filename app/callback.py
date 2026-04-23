@@ -14,7 +14,7 @@ PRIVATE_KEY_PATH = os.path.join(BASE_DIR, "keys", "private_key.pem")
 private_key = load_private_key(PRIVATE_KEY_PATH)
 
 # 🔁 Toggle this
-DEBUG_MODE = True   # 👉 change to False in production
+DEBUG_MODE = False   # 👉 change to False in production
 
 
 def ack_xml():
