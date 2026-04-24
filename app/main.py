@@ -29,7 +29,7 @@ def create_payment(amount: float, customer_name: str):
 def heartbeat():
     while True:
         print("🟢 SWITRUS SERVER RUNNING & LISTENING...")
-        time.sleep(10)
+        time.sleep(1)
 
 
 @app.on_event("startup")
