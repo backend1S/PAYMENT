@@ -17,7 +17,9 @@ private_key = load_private_key(PRIVATE_KEY)
 
 def create_payment_api(amount, booking_id, customer_name):
 
-    # ✅ AUTO BOOKING ID
+    # =========================
+    # 1️⃣ GENERATE IDS
+    # =========================
     if not booking_id:
         booking_id = "BK" + uuid.uuid4().hex[:8]
 
@@ -37,7 +39,9 @@ def create_payment_api(amount, booking_id, customer_name):
     print("\n🔹 PLAIN REQUEST:")
     print(json.dumps(payload, indent=4))
 
-    # 🔐 ENCRYPT
+    # =========================
+    # 2️⃣ ENCRYPT REQUEST
+    # =========================
     encrypted = encrypt_payload(payload, public_key)
 
     print("\n🔹 ENCRYPTED REQUEST:")
@@ -48,7 +52,9 @@ def create_payment_api(amount, booking_id, customer_name):
         "apikey": ICICI_API_KEY
     }
 
-    # 🔁 RETRY (ICICI sometimes fails)
+    # =========================
+    # 3️⃣ CALL ICICI (WITH RETRY)
+    # =========================
     def call_icici():
         for _ in range(2):
             res = requests.post(ICICI_URL, data=encrypted, headers=headers, timeout=60)
@@ -65,7 +71,9 @@ def create_payment_api(amount, booking_id, customer_name):
     except Exception as e:
         return {"status": "failed", "error": str(e)}
 
-    # ❌ HANDLE ICICI ERROR
+    # =========================
+    # 4️⃣ HANDLE ICICI ERROR
+    # =========================
     if not res.text or res.text.startswith("Internal"):
         return {
             "status": "failed",
@@ -73,7 +81,9 @@ def create_payment_api(amount, booking_id, customer_name):
             "raw": res.text
         }
 
-    # 🔓 DECRYPT RESPONSE
+    # =========================
+    # 5️⃣ DECRYPT RESPONSE
+    # =========================
     try:
         decrypted = decrypt_response(res.text, private_key)
     except Exception as e:
@@ -86,7 +96,6 @@ def create_payment_api(amount, booking_id, customer_name):
     print("\n🔹 DECRYPTED RESPONSE:")
     print(json.dumps(decrypted, indent=4))
 
-    # ❌ ICICI BUSINESS ERROR
     if decrypted.get("success") == "false":
         return {
             "status": "failed",
@@ -101,7 +110,9 @@ def create_payment_api(amount, booking_id, customer_name):
             "icici_response": decrypted
         }
 
-    # ✅ CORRECT UPI LINK (ICICI FORMAT)
+    # =========================
+    # 6️⃣ GENERATE UPI LINK
+    # =========================
     upi_link = (
         f"upi://pay?"
         f"pa={ICICI_VPA}&"
@@ -115,28 +126,30 @@ def create_payment_api(amount, booking_id, customer_name):
     print("\n✅ FINAL UPI LINK:")
     print(upi_link)
 
-    # 🔥 GENERATE QR
+    # =========================
+    # 7️⃣ GENERATE QR
+    # =========================
     qr = qrcode.make(upi_link)
 
-    # Save image file
     file_name = f"{booking_id}.png"
     qr.save(file_name)
 
-    print(f"✅ QR saved as {file_name}")
-
-    # Convert to base64
     buffer = BytesIO()
     qr.save(buffer, format="PNG")
     qr_base64 = base64.b64encode(buffer.getvalue()).decode()
 
-    # 💾 SAVE TO DB
+    print(f"✅ QR saved as {file_name}")
+
+    # =========================
+    # 8️⃣ SAVE TO DB (FIXED)
+    # =========================
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("""
             INSERT INTO PAYMENT (
-                PAYMENT_ID,
+                merchantTranId,
                 BOOKING_ID,
                 AMOUNT,
                 CURRENCY,
@@ -150,7 +163,7 @@ def create_payment_api(amount, booking_id, customer_name):
             )
             VALUES (?, ?, ?, 'INR', ?, 'UPI', 'PENDING', ?, ?, GETDATE(), GETDATE())
         """,
-            txn_id,
+            txn_id,          # merchantTranId
             booking_id,
             amount,
             customer_name,
@@ -173,7 +186,9 @@ def create_payment_api(amount, booking_id, customer_name):
             "message": "Payment created but DB failed"
         }
 
-    # ✅ FINAL RESPONSE
+    # =========================
+    # 9️⃣ FINAL RESPONSE
+    # =========================
     return {
         "status": "success",
         "booking_id": booking_id,
